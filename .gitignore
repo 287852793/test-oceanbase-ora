@@ -1,0 +1,5 @@
+# OceanBase 运行时数据与配置（保留目录占位文件）
+/volumes/data/ob/*
+!/volumes/data/ob/.gitkeep
+/volumes/conf/obd/cluster/*
+!/volumes/conf/obd/cluster/.gitkeep
