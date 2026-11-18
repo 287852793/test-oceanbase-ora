@@ -144,6 +144,7 @@ jdbc:oceanbase://<HOST_IP>:2881/
 - 容器已 `--purge` 删除：重新创建容器，挂载同一 `volumes/`，obd 检测到已有配置后直接启动原集群，数据保留。
 - 初始化步骤是幂等的：已存在的资源单元、资源池、租户、用户、示例表会自动跳过；若修改了 `ORA_CPU`，脚本会自动调整已有 `ora_unit` 的 CPU。
 - 镜像自带的 test 租户默认会占用 sys 租户之外的剩余 CPU，`run.sh` 会将其 `MAX_CPU` 自动限制为 `TEST_TENANT_MAX_CPU`（默认 1），为 Oracle 租户释放资源。
+- 集群日志盘不足时，`run.sh` 会自动执行 `ALTER SYSTEM SET log_disk_size` 扩容到 `OB_LOG_DISK_SIZE`，再创建资源池。
 
 ## 持久化说明
 
@@ -177,6 +178,8 @@ rm -rf volumes/data/ob/* volumes/conf/obd/cluster/*
 | `MODE` | `mini` | 镜像部署规格 |
 | `OB_MEMORY_LIMIT` | `10G` | OceanBase 总内存 |
 | `OB_SYSTEM_MEMORY` | `2G` | 系统预留内存 |
+| `OB_DATAFILE_SIZE` | `5G` | 数据盘大小 |
+| `OB_LOG_DISK_SIZE` | `10G` | 集群日志盘总容量；需容纳 sys 2G + test 2G + Oracle 2G，至少 6G |
 | `OB_SYS_PASSWORD` | `root123456` | sys 租户 root 密码 |
 | `OB_TENANT_NAME` | `test` | 镜像自带的 MySQL 模式租户名 |
 | `OB_TENANT_MIN_CPU` / `OB_TENANT_MEMORY_SIZE` | `1` / `2G` | 自带租户规格（为 Oracle 租户预留资源） |
@@ -238,6 +241,21 @@ ALTER RESOURCE UNIT test_unit MAX_CPU = 1, MIN_CPU = 1;
 ```sql
 DROP TENANT test;
 ```
+
+如果日志出现 `LOG_DISK resource not enough`，说明集群日志盘容量不足。`sys` 2G + `test` 2G + Oracle 2G 合计至少需要 6G，`run.sh` 会自动检测并动态扩容：
+
+```sql
+ALTER SYSTEM SET log_disk_size = '10G';
+```
+
+验证：
+
+```bash
+docker exec oceanbase-ora obclient -h127.0.0.1 -P2881 -uroot@sys -proot123456 -A -Doceanbase \
+  -e 'SELECT LOG_DISK_CAPACITY, LOG_DISK_ASSIGNED FROM oceanbase.GV$OB_SERVERS;'
+```
+
+`log_disk_size` 的 `edit_level` 为 `DYNAMIC_EFFECTIVE`，无需重启容器。容器重启后 obd 可能按持久化配置恢复到旧值，`run.sh` 每次会重新检查并扩容。
 
 **2. 端口 2881 被占用**
 

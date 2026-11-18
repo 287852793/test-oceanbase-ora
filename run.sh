@@ -235,6 +235,96 @@ init_cluster_timezone() {
   fi
 }
 
+size_to_mb() {
+  local v="$1"
+  local n
+  case "$v" in
+    *[Gg]) n="${v%[Gg]}"; awk -v n="$n" 'BEGIN { printf "%d", n * 1024 }' ;;
+    *[Mm]) n="${v%[Mm]}"; awk -v n="$n" 'BEGIN { printf "%d", n }' ;;
+    *) echo "$v" ;;
+  esac
+}
+
+query_server_free_log_disk_mb() {
+  query_sys "SELECT ROUND((LOG_DISK_CAPACITY - LOG_DISK_ASSIGNED)/1048576) FROM oceanbase.GV\$OB_SERVERS LIMIT 1;"
+}
+
+query_server_log_disk_capacity_mb() {
+  query_sys "SELECT ROUND(LOG_DISK_CAPACITY/1048576) FROM oceanbase.GV\$OB_SERVERS LIMIT 1;"
+}
+
+ensure_log_disk_capacity() {
+  local required_mb desired_mb current_mb free_mb i
+  required_mb="$(size_to_mb "$ORA_LOG_DISK")"
+  desired_mb="$(size_to_mb "$OB_LOG_DISK_SIZE")"
+
+  free_mb="$(query_server_free_log_disk_mb || true)"
+  current_mb="$(query_server_log_disk_capacity_mb || true)"
+
+  if [ -z "$free_mb" ] || [ -z "$current_mb" ]; then
+    log "警告：无法获取服务器日志盘信息，跳过日志盘预检。"
+    return 0
+  fi
+
+  if [ "$free_mb" -ge "$required_mb" ]; then
+    log "日志盘剩余 ${free_mb}MB，满足 Oracle 租户需求 ${required_mb}MB。"
+    return 0
+  fi
+
+  if [ "$current_mb" -ge "$desired_mb" ]; then
+    log "错误：日志盘剩余 ${free_mb}MB，不足 ${required_mb}MB；当前容量 ${current_mb}MB 已达到配置 OB_LOG_DISK_SIZE=${OB_LOG_DISK_SIZE}。"
+    log "请调大 conf/ob.env 的 OB_LOG_DISK_SIZE，或删除 test 租户释放日志盘后重试。"
+    exit 1
+  fi
+
+  log "日志盘剩余 ${free_mb}MB，不足 ${required_mb}MB；扩容 log_disk_size 到 ${OB_LOG_DISK_SIZE}..."
+  if ! ob_sys -e "ALTER SYSTEM SET log_disk_size = '${OB_LOG_DISK_SIZE}';" >/dev/null; then
+    log "错误：扩容日志盘失败，请检查 log_disk_size 配置。"
+    exit 1
+  fi
+
+  for i in $(seq 1 12); do
+    sleep 2
+    free_mb="$(query_server_free_log_disk_mb || true)"
+    if [ -n "$free_mb" ] && [ "$free_mb" -ge "$required_mb" ]; then
+      log "日志盘扩容完成，剩余 ${free_mb}MB。"
+      return 0
+    fi
+  done
+
+  log "错误：日志盘扩容后仍未满足需求（剩余 ${free_mb:-未知}MB，需要 ${required_mb}MB）。"
+  log "请调大 conf/ob.env 的 OB_LOG_DISK_SIZE，或删除 test 租户。"
+  exit 1
+}
+
+wait_cpu_released() {
+  local i free
+  for i in $(seq 1 24); do
+    free="$(query_sys "SELECT CPU_CAPACITY_MAX - CPU_ASSIGNED_MAX FROM oceanbase.GV\$OB_SERVERS LIMIT 1;" || true)"
+    if [ -n "$free" ] && awk -v a="$free" -v b="$ORA_CPU" 'BEGIN { exit !(a >= b) }'; then
+      log "可用 CPU=${free}，满足 ORA_CPU=${ORA_CPU}。"
+      return 0
+    fi
+    log "等待 CPU 资源释放（当前可用 CPU=${free:-未知}，需要 ${ORA_CPU}）..."
+    sleep 5
+  done
+  log "警告：等待 CPU 资源释放超时（当前可用 CPU=${free:-未知}），仍继续尝试创建资源池。"
+}
+
+create_pool_with_retry() {
+  local i
+  for i in $(seq 1 3); do
+    if exec_sql_sys sql/02_create_pool.sql; then
+      return 0
+    fi
+    if [ "$i" -lt 3 ]; then
+      log "创建资源池失败，等待 15 秒后重试（${i}/3）..."
+      sleep 15
+    fi
+  done
+  return 1
+}
+
 get_zone() {
   local zone
   zone="$(query_sys "SELECT ZONE FROM oceanbase.DBA_OB_ZONES LIMIT 1;")"
@@ -297,6 +387,7 @@ limit_test_tenant_cpu() {
 
 init_oracle_tenant() {
   limit_test_tenant_cpu
+  wait_cpu_released
   ZONE="$(get_zone)"
   log "使用 zone：${ZONE}"
 
@@ -322,9 +413,9 @@ init_oracle_tenant() {
   cnt="$(query_sys "SELECT COUNT(*) FROM oceanbase.DBA_OB_RESOURCE_POOLS WHERE NAME='${ORA_POOL}';")"
   if [ "${cnt:-0}" = "0" ]; then
     log "创建资源池 ${ORA_POOL}..."
-    if ! exec_sql_sys sql/02_create_pool.sql; then
-      log "错误：创建资源池失败，通常为 zone 内 CPU 或内存不足。"
-      log "请确认 test 租户已释放 CPU（当前限制为 ${TEST_TENANT_MAX_CPU}），或调小 ORA_CPU/ORA_MEMORY 后重试。"
+    if ! create_pool_with_retry; then
+      log "错误：创建资源池失败，通常为 zone 内 CPU、内存或日志盘不足。"
+      log "请检查 test 租户资源释放情况、OB_LOG_DISK_SIZE，或调小 ORA_CPU/ORA_MEMORY 后重试。"
       exit 1
     fi
   else
@@ -441,6 +532,7 @@ fi
 wait_for_boot
 wait_for_sys
 init_cluster_timezone
+ensure_log_disk_capacity
 init_oracle_tenant
 init_oracle_accounts
 print_connection_info
