@@ -166,7 +166,7 @@ rm -rf volumes/data/ob/* volumes/conf/obd/cluster/*
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `OB_IMAGE` | `oceanbase/oceanbase-ce:4.3.5.0` | 官方镜像，按需改为实际可用 tag |
+| `OB_IMAGE` | `oceanbase/oceanbase-ce:4.3.5-lts` | 官方镜像，按需改为实际可用 tag |
 | `CONTAINER_NAME` | `oceanbase-ora` | 容器名 |
 | `HOST_PORT` | `2881` | 宿主机映射端口（对外访问端口） |
 | `TZ` | `Asia/Shanghai` | 容器时区 |
@@ -231,8 +231,8 @@ docker network rm oceanbase-ora-net
 确认 Docker Hub 上可用的 4.3.x tag，并修改 `OB_IMAGE`。也可以改用：
 
 ```
-quay.io/oceanbase/oceanbase-ce:4.3.5.0
-ghcr.io/oceanbase/oceanbase-ce:4.3.5.0
+quay.io/oceanbase/oceanbase-ce:4.3.5-lts
+ghcr.io/oceanbase/oceanbase-ce:4.3.5-lts
 ```
 
 **6. 脚本在 Windows 编辑后无法执行**
