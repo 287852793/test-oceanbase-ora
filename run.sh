@@ -229,9 +229,9 @@ query_oracle_app() {
 }
 
 init_cluster_timezone() {
-  log "设置数据库时区为 +08:00..."
-  if ! ob_sys -e "ALTER SYSTEM SET time_zone = '+08:00';" >/dev/null 2>&1; then
-    log "警告：数据库时区设置失败，继续执行。"
+  log "设置数据库全局时区为 +08:00..."
+  if ! ob_sys -e "SET GLOBAL time_zone = '+08:00';" >/dev/null; then
+    log "警告：设置全局时区失败（容器时区仍由 TZ 控制），可稍后手动检查。"
   fi
 }
 
@@ -260,24 +260,73 @@ wait_tenant_normal() {
   exit 1
 }
 
+limit_test_tenant_cpu() {
+  if [ "${TEST_TENANT_MAX_CPU:-1}" = "0" ]; then
+    log "TEST_TENANT_MAX_CPU=0，跳过 test 租户 CPU 限制。"
+    return 0
+  fi
+
+  local unit_name current
+  unit_name="$(query_sys "SELECT uc.NAME FROM oceanbase.DBA_OB_UNITS u JOIN oceanbase.DBA_OB_UNIT_CONFIGS uc ON u.UNIT_CONFIG_ID = uc.UNIT_CONFIG_ID JOIN oceanbase.DBA_OB_TENANTS t ON u.TENANT_ID = t.TENANT_ID WHERE t.TENANT_NAME = '${OB_TENANT_NAME}' LIMIT 1;")"
+  if [ -z "$unit_name" ]; then
+    log "未找到 test 租户 ${OB_TENANT_NAME} 的资源单元，跳过 CPU 限制。"
+    return 0
+  fi
+
+  current="$(query_sys "SELECT MAX_CPU FROM oceanbase.DBA_OB_UNIT_CONFIGS WHERE NAME='${unit_name}';")"
+  if [ -z "$current" ]; then
+    log "无法获取资源单元 ${unit_name} 的 MAX_CPU，跳过 CPU 限制。"
+    return 0
+  fi
+
+  if ! awk -v a="$current" -v b="$TEST_TENANT_MAX_CPU" 'BEGIN { exit !(a > b) }'; then
+    log "test 租户资源单元 ${unit_name} 当前 MAX_CPU=${current}，无需限制。"
+    return 0
+  fi
+
+  log "test 租户资源单元 ${unit_name} 当前 MAX_CPU=${current}，限制为 ${TEST_TENANT_MAX_CPU} 以释放 CPU..."
+  if ! ob_sys -e "ALTER RESOURCE UNIT ${unit_name} MAX_CPU = ${TEST_TENANT_MAX_CPU}, MIN_CPU = ${TEST_TENANT_MAX_CPU};" >/dev/null; then
+    log "错误：调整 test 租户资源单元 ${unit_name} 失败。"
+    log "可手动执行 DROP TENANT ${OB_TENANT_NAME}; 并等待资源回收后重新执行 ./run.sh"
+    exit 1
+  fi
+  sleep 2
+  current="$(query_sys "SELECT MAX_CPU FROM oceanbase.DBA_OB_UNIT_CONFIGS WHERE NAME='${unit_name}';")"
+  log "test 租户资源单元 ${unit_name} 调整后 MAX_CPU=${current:-未知}"
+}
+
 init_oracle_tenant() {
+  limit_test_tenant_cpu
   ZONE="$(get_zone)"
   log "使用 zone：${ZONE}"
 
-  local cnt
+  local cnt current_cpu
 
   cnt="$(query_sys "SELECT COUNT(*) FROM oceanbase.DBA_OB_UNIT_CONFIGS WHERE NAME='${ORA_UNIT}';")"
   if [ "${cnt:-0}" = "0" ]; then
     log "创建资源单元 ${ORA_UNIT}..."
     exec_sql_sys sql/01_create_unit.sql
   else
-    log "资源单元 ${ORA_UNIT} 已存在，跳过。"
+    current_cpu="$(query_sys "SELECT MAX_CPU FROM oceanbase.DBA_OB_UNIT_CONFIGS WHERE NAME='${ORA_UNIT}';")"
+    if [ -n "$current_cpu" ] && awk -v a="$current_cpu" -v b="$ORA_CPU" 'BEGIN { exit !(a != b) }'; then
+      log "资源单元 ${ORA_UNIT} 已存在但 MAX_CPU=${current_cpu}，按配置调整为 ${ORA_CPU}..."
+      if ! ob_sys -e "ALTER RESOURCE UNIT ${ORA_UNIT} MAX_CPU = ${ORA_CPU}, MIN_CPU = ${ORA_CPU};" >/dev/null; then
+        log "错误：调整资源单元 ${ORA_UNIT} 的 CPU 失败。"
+        exit 1
+      fi
+    else
+      log "资源单元 ${ORA_UNIT} 已存在，跳过创建。"
+    fi
   fi
 
   cnt="$(query_sys "SELECT COUNT(*) FROM oceanbase.DBA_OB_RESOURCE_POOLS WHERE NAME='${ORA_POOL}';")"
   if [ "${cnt:-0}" = "0" ]; then
     log "创建资源池 ${ORA_POOL}..."
-    exec_sql_sys sql/02_create_pool.sql
+    if ! exec_sql_sys sql/02_create_pool.sql; then
+      log "错误：创建资源池失败，通常为 zone 内 CPU 或内存不足。"
+      log "请确认 test 租户已释放 CPU（当前限制为 ${TEST_TENANT_MAX_CPU}），或调小 ORA_CPU/ORA_MEMORY 后重试。"
+      exit 1
+    fi
   else
     log "资源池 ${ORA_POOL} 已存在，跳过。"
   fi
@@ -285,7 +334,10 @@ init_oracle_tenant() {
   cnt="$(query_sys "SELECT COUNT(*) FROM oceanbase.DBA_OB_TENANTS WHERE TENANT_NAME='${ORA_TENANT}';")"
   if [ "${cnt:-0}" = "0" ]; then
     log "创建 Oracle 模式租户 ${ORA_TENANT}..."
-    exec_sql_sys sql/03_create_tenant.sql
+    if ! exec_sql_sys sql/03_create_tenant.sql; then
+      log "错误：创建租户 ${ORA_TENANT} 失败，请检查资源池与 zone 配置。"
+      exit 1
+    fi
   else
     log "租户 ${ORA_TENANT} 已存在，跳过创建。"
   fi

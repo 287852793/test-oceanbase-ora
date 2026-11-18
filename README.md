@@ -142,7 +142,8 @@ jdbc:oceanbase://<HOST_IP>:2881/
 
 - 容器未删除：自动 `docker start` 复用，数据保留。
 - 容器已 `--purge` 删除：重新创建容器，挂载同一 `volumes/`，obd 检测到已有配置后直接启动原集群，数据保留。
-- 初始化步骤是幂等的：已存在的资源单元、资源池、租户、用户、示例表会自动跳过。
+- 初始化步骤是幂等的：已存在的资源单元、资源池、租户、用户、示例表会自动跳过；若修改了 `ORA_CPU`，脚本会自动调整已有 `ora_unit` 的 CPU。
+- 镜像自带的 test 租户默认会占用 sys 租户之外的剩余 CPU，`run.sh` 会将其 `MAX_CPU` 自动限制为 `TEST_TENANT_MAX_CPU`（默认 1），为 Oracle 租户释放资源。
 
 ## 持久化说明
 
@@ -179,6 +180,7 @@ rm -rf volumes/data/ob/* volumes/conf/obd/cluster/*
 | `OB_SYS_PASSWORD` | `root123456` | sys 租户 root 密码 |
 | `OB_TENANT_NAME` | `test` | 镜像自带的 MySQL 模式租户名 |
 | `OB_TENANT_MIN_CPU` / `OB_TENANT_MEMORY_SIZE` | `1` / `2G` | 自带租户规格（为 Oracle 租户预留资源） |
+| `TEST_TENANT_MAX_CPU` | `1` | test 租户 CPU 上限，脚本启动时自动限制；设为 0 表示不限制 |
 | `ORA_TENANT` | `ora_tenant` | Oracle 模式租户名 |
 | `ORA_CPU` / `ORA_MEMORY` / `ORA_LOG_DISK` | `2` / `4G` / `2G` | Oracle 租户资源规格 |
 | `ORA_SYS_PASSWORD` | `oracle123456` | Oracle 租户 sys 用户密码 |
@@ -191,12 +193,16 @@ rm -rf volumes/data/ob/* volumes/conf/obd/cluster/*
 ## 时区说明
 
 - 容器启动时传入 `TZ=Asia/Shanghai`，并将宿主机 `/usr/share/zoneinfo/Asia/Shanghai` 挂载为容器 `/etc/localtime`。
-- 初始化时执行 `ALTER SYSTEM SET time_zone = '+08:00'`。
+- 初始化时在 sys 租户执行 `SET GLOBAL time_zone = '+08:00';`。
 - 验证：
 
   ```bash
   docker exec oceanbase-ora date
   # 预期包含 CST 与 +0800
+
+  docker exec -i oceanbase-ora obclient -h127.0.0.1 -P2881 -uroot@sys -proot123456 -A -Doceanbase \
+    -e "SELECT @@time_zone;"
+  # 预期输出 +08:00
   ```
 
 ## 常见问题
@@ -208,7 +214,30 @@ rm -rf volumes/data/ob/* volumes/conf/obd/cluster/*
 docker logs --tail 100 oceanbase-ora
 ```
 
-常见原因是内存不足。可调小 `conf/ob.env` 中的 `OB_MEMORY_LIMIT`、`OB_SYSTEM_MEMORY`、`OB_TENANT_MEMORY_SIZE`、`ORA_MEMORY`，确保宿主机内存大于 `OB_MEMORY_LIMIT`。
+常见原因是内存或 CPU 不足。可调小 `conf/ob.env` 中的 `OB_MEMORY_LIMIT`、`OB_SYSTEM_MEMORY`、`OB_TENANT_MEMORY_SIZE`、`ORA_MEMORY`，确保宿主机内存大于 `OB_MEMORY_LIMIT`。
+
+如果日志出现 `CPU resource not enough`，说明 zone 内 CPU 已被占满。`run.sh` 会先将 test 租户的 `MAX_CPU` 限制为 `TEST_TENANT_MAX_CPU`（默认 1）；若仍不足，可继续调小 `ORA_CPU`（如 `1`）。也可手动查看与调整：
+
+```bash
+# 注意 SQL 中的 $ 需要使用单引号，避免 Shell 展开
+docker exec oceanbase-ora obclient -h127.0.0.1 -P2881 -uroot@sys -proot123456 -A -Doceanbase \
+  -e 'SELECT SVR_IP, ZONE, CPU_CAPACITY, CPU_ASSIGNED FROM oceanbase.GV$OB_SERVERS;'
+
+docker exec oceanbase-ora obclient -h127.0.0.1 -P2881 -uroot@sys -proot123456 -A -Doceanbase \
+  -e "SELECT NAME, MAX_CPU, MIN_CPU, MEMORY_SIZE FROM oceanbase.DBA_OB_UNIT_CONFIGS;"
+```
+
+手动释放 test 租户 CPU（unit 名称以上述查询结果为准）：
+
+```sql
+ALTER RESOURCE UNIT test_unit MAX_CPU = 1, MIN_CPU = 1;
+```
+
+如仍无法创建资源池，可删除默认 test 租户（谨慎操作，删除后需等待资源回收）：
+
+```sql
+DROP TENANT test;
+```
 
 **2. 端口 2881 被占用**
 
